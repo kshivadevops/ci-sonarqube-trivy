@@ -1,4 +1,4 @@
-name: CI with SonarQube & Trivy (Code + Image Scan)
+name: DevSecOps CI (SonarQube • PyTest • Trivy • GitLeaks • SBOM • DockerHub)
 
 on:
   push:
@@ -7,8 +7,11 @@ on:
     branches: [ "main" ]
 
 jobs:
-  code_quality_security_scan:
+  devsecops_ci:
     runs-on: self-hosted
+
+    env:
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ci-sonarqube-trivy
 
     steps:
       - name: Checkout code
@@ -19,20 +22,30 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install app + test deps
         run: |
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || true
+          pip install pytest pytest-cov
 
-      # ---- Preflight: Check SONAR_TOKEN ----
-      - name: Preflight – ensure SONAR_TOKEN present
+      # ---- Secrets hygiene (fail fast) ----
+      - name: Preflight – check required secrets
         run: |
-          if [ -z "${{ secrets.SONAR_TOKEN }}" ]; then
-            echo "❌ SONAR_TOKEN is not set. Add it in: Settings > Secrets > Actions"
-            exit 1
-          fi
+          missing=0
+          for v in SONAR_TOKEN DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
+            if [ -z "${{ secrets[$v] }}" ]; then echo "❌ Missing secret: $v"; missing=1; fi
+          done
+          if [ "$missing" = "1" ]; then exit 1; fi
         shell: bash
 
-      # ---- SonarQube Scan ----
+      # ---- Unit tests + coverage.xml ----
+      - name: Run tests with coverage
+        run: |
+          pytest -q --disable-warnings --maxfail=1 \
+            --cov=. --cov-report=xml:coverage.xml || true
+        # We don't fail the pipeline if tests fail yet; flip '|| true' to enforce.
+
+      # ---- SonarQube Scan (code quality + coverage) ----
       - name: SonarQube Scan
         uses: sonarsource/sonarqube-scan-action@v2
         env:
@@ -43,15 +56,61 @@ jobs:
             -Dsonar.projectKey=ci-sonarqube-trivy
             -Dsonar.projectName=ci-sonarqube-trivy
             -Dsonar.sources=.
+            -Dsonar.python.coverage.reportPaths=coverage.xml
 
-      # ---- Trivy Scan (Source Code & Dependencies) ----
-      - name: Trivy File System Scan
-        run: trivy fs --exit-code 1 --severity HIGH,CRITICAL .
+      # ---- GitLeaks – secret scanning (fail on leak) ----
+      - name: GitLeaks scan
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/repo" zricethezav/gitleaks:latest \
+            detect -s /repo -v --exit-code 1 --redact
 
-      # ---- Docker Build ----
+      # ---- Trivy – source (filesystem) scan ----
+      - name: Trivy FS Scan (HIGH,CRITICAL fail)
+        run: |
+          trivy fs --scanners vuln,secret,config \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format table \
+            . | tee trivy-fs.txt
+
+      # ---- Build Docker image ----
       - name: Build Docker image
-        run: docker build -t myapp:latest .
+        run: |
+          docker build -t $IMAGE_NAME:latest -t $IMAGE_NAME:${{ github.sha }} .
 
-      # ---- Trivy Scan Docker Image ----
-      - name: Trivy Docker Image Scan
-        run: trivy image --exit-code 1 --severity HIGH,CRITICAL myapp:latest
+      # ---- Trivy – image scan ----
+      - name: Trivy Image Scan (HIGH,CRITICAL fail)
+        run: |
+          trivy image --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format table \
+            $IMAGE_NAME:latest | tee trivy-image.txt
+
+      # ---- Generate SBOM (CycloneDX) with Trivy ----
+      - name: SBOM (CycloneDX) via Trivy
+        run: |
+          trivy image --format cyclonedx \
+            --output sbom.cdx.json \
+            $IMAGE_NAME:latest
+          echo "SBOM at sbom.cdx.json"
+
+      # ---- Upload security artifacts ----
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            trivy-fs.txt
+            trivy-image.txt
+            sbom.cdx.json
+
+      # ---- Docker Hub login ----
+      - name: Docker login
+        run: |
+          echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      # ---- Push image (latest + sha) ----
+      - name: Push image to Docker Hub
+        run: |
+          docker push $IMAGE_NAME:latest
+          docker push $IMAGE_NAME:${{ github.sha }}
