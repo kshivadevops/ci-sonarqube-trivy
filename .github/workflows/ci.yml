@@ -23,11 +23,26 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: SonarQube Scan
+      - name: Preflight – ensure SONAR_TOKEN present
+        run: |
+          if [ -z "${SONAR_TOKEN}" ]; then
+          echo "SONAR_TOKEN is empty. Set repo secret SONAR_TOKEN."
+          exit 1
+          fi
+          env:
+           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+          - name: SonarQube Scan
         uses: sonarsource/sonarqube-scan-action@v2
         env:
-          SONAR_HOST_URL: "http://host.docker.internal:9000"
+          SONAR_HOST_URL: "http://host.docker.internal:9000"  # for Docker-in-Docker on self-hosted
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+         args: >
+           -Dsonar.projectKey=ci-sonarqube-trivy
+           -Dsonar.projectName=ci-sonarqube-trivy
+           -Dsonar.sources=.
+
 
       - name: Trivy File System Scan
         run: trivy fs --exit-code 1 --severity HIGH,CRITICAL .
