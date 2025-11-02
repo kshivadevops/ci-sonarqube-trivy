@@ -28,14 +28,17 @@ jobs:
           pip install -r requirements.txt || true
           pip install pytest pytest-cov
 
-      # ---- Secrets hygiene (fail fast) ----
+      # ---- Preflight: Check required secrets ----
       - name: Preflight – check required secrets
         run: |
-          missing=0
-          for v in SONAR_TOKEN DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
-            if [ -z "${{ secrets[$v] }}" ]; then echo "❌ Missing secret: $v"; missing=1; fi
-          done
-          if [ "$missing" = "1" ]; then exit 1; fi
+          if [ -z "${SONAR_TOKEN}" ]; then echo "❌ Missing secret: SONAR_TOKEN"; exit 1; fi
+          if [ -z "${DOCKERHUB_USERNAME}" ]; then echo "❌ Missing secret: DOCKERHUB_USERNAME"; exit 1; fi
+          if [ -z "${DOCKERHUB_TOKEN}" ]; then echo "❌ Missing secret: DOCKERHUB_TOKEN"; exit 1; fi
+          echo "✅ All required secrets are present"
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
         shell: bash
 
       # ---- Unit tests + coverage.xml ----
@@ -43,7 +46,6 @@ jobs:
         run: |
           pytest -q --disable-warnings --maxfail=1 \
             --cov=. --cov-report=xml:coverage.xml || true
-        # We don't fail the pipeline if tests fail yet; flip '|| true' to enforce.
 
       # ---- SonarQube Scan (code quality + coverage) ----
       - name: SonarQube Scan
@@ -58,7 +60,7 @@ jobs:
             -Dsonar.sources=.
             -Dsonar.python.coverage.reportPaths=coverage.xml
 
-      # ---- GitLeaks – secret scanning (fail on leak) ----
+      # ---- GitLeaks – secret scanning ----
       - name: GitLeaks scan
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" zricethezav/gitleaks:latest \
@@ -86,13 +88,13 @@ jobs:
             --format table \
             $IMAGE_NAME:latest | tee trivy-image.txt
 
-      # ---- Generate SBOM (CycloneDX) with Trivy ----
+      # ---- Generate SBOM (CycloneDX) ----
       - name: SBOM (CycloneDX) via Trivy
         run: |
           trivy image --format cyclonedx \
             --output sbom.cdx.json \
             $IMAGE_NAME:latest
-          echo "SBOM at sbom.cdx.json"
+          echo "SBOM generated at sbom.cdx.json"
 
       # ---- Upload security artifacts ----
       - name: Upload security artifacts
